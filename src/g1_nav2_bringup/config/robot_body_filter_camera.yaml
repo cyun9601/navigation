@@ -1,0 +1,23 @@
+# robot_body_filter config for the RGBD depth cloud.
+# Used only when sim.launch.py is run with use_body_filter:=true.
+/**:
+  ros__parameters:
+    frames/fixed: odom
+    frames/sensor: camera_depth_optical_frame
+    frames/filtering: camera_depth_optical_frame
+    frames/output: camera_depth_optical_frame
+    sensor/point_by_point: false
+    sensor/min_distance: 0.05
+    sensor/max_distance: 8.0
+    filter/keep_clouds_organized: false
+    filter/do_clipping: true
+    filter/do_contains_test: true
+    filter/do_shadow_test: false
+    body_model/robot_description_param: robot_description
+    body_model/inflation/scale: 1.1
+    body_model/inflation/padding: 0.03
+    transforms/buffer_length: 30.0
+    transforms/timeout/reachable: 0.2
+    transforms/timeout/unreachable: 0.2
+    ignored_links/bounding_sphere: ["lidar_link", "camera_link", "camera_depth_optical_frame"]
+    ignored_links/contains_test: ["lidar_link", "camera_link", "camera_depth_optical_frame"]

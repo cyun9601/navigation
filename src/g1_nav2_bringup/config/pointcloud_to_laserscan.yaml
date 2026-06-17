@@ -1,0 +1,16 @@
+pointcloud_to_laserscan:
+  ros__parameters:
+    # Flatten the (self-filtered) 3D LiDAR cloud into a 2D /scan for nav2.
+    target_frame: base_link          # project the slice into the base frame
+    transform_tolerance: 0.1
+    min_height: 0.10                 # ignore floor returns
+    max_height: 1.80                 # capture obstacle + wall tops
+    angle_min: -3.14159
+    angle_max: 3.14159
+    angle_increment: 0.0087266       # ~0.5 deg
+    scan_time: 0.1
+    range_min: 0.20
+    range_max: 20.0
+    use_inf: true
+    inf_epsilon: 1.0
+    concurrency_level: 1

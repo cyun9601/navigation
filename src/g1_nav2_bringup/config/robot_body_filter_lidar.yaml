@@ -1,0 +1,24 @@
+# robot_body_filter (peci1/robot_body_filter) config for the 3D LiDAR cloud.
+# Used only when sim.launch.py is run with use_body_filter:=true.
+# Removes points that fall inside the G1 collision model (read from URDF).
+/**:
+  ros__parameters:
+    frames/fixed: odom
+    frames/sensor: lidar_link
+    frames/filtering: lidar_link
+    frames/output: lidar_link
+    sensor/point_by_point: false
+    sensor/min_distance: 0.10
+    sensor/max_distance: 20.0
+    filter/keep_clouds_organized: false
+    filter/do_clipping: true
+    filter/do_contains_test: true
+    filter/do_shadow_test: false
+    body_model/robot_description_param: robot_description
+    body_model/inflation/scale: 1.1
+    body_model/inflation/padding: 0.03
+    transforms/buffer_length: 30.0
+    transforms/timeout/reachable: 0.2
+    transforms/timeout/unreachable: 0.2
+    ignored_links/bounding_sphere: ["lidar_link", "camera_link", "camera_depth_optical_frame"]
+    ignored_links/contains_test: ["lidar_link", "camera_link", "camera_depth_optical_frame"]
