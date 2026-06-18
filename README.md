@@ -139,6 +139,108 @@ This routes `/lidar/points_raw`→`/lidar/points_filtered` and
 instead of the built-in filter. (Configs in `g1_nav2_bringup/config/`. Not built
 here — offline; the built-in filter is the verified default.)
 
+## Holding an object (payload self-filter — works for unknown shapes)
+When the robot grasps something, that object is **not** in the URDF, so the
+LiDAR/camera strike it and nav2 marks it as an obstacle ~0.3 m in front of the
+robot — the robot **freezes while carrying a load**. The filter removes it.
+You do **not** need to know the object's shape in advance. There is a spectrum
+from full prior knowledge to none, selected by `held_filter_mode`:
+
+| mode | prior knowledge | how | trade-off |
+|------|-----------------|-----|-----------|
+| `connected` (**default**) | **none** | remove the cloud region spatially **connected to the gripper** (region-grow), shared across sensors as a grasp-frame voxel hull | **size-invariant** (a broom is removed end-to-end, no dead-zone) and works **while stationary**; needs a dense-enough cloud (the depth camera) |
+| `carry_volume` | **none** | drop everything in a fixed sphere attached to the hand | trivial & robust, but over-removes a fixed dead-zone and **breaks per object size** |
+| `online` | **none** | estimate the payload's occupied voxels in the grasp frame, learning only while the base moves | recovers free space, any shape — but needs motion and can leak when still |
+| `shape` | object shape known (grasp DB) | a primitive rigidly fixed to the grasp link — MoveIt *attached collision object* / `robot_body_filter` | tightest & motion-independent, but needs a model per object |
+
+**Why `connected` is the default.** A fixed sphere (`carry_volume`) is the thing
+you flagged — its behaviour depends entirely on the object: too small and a
+broom's far end is left as a phantom obstacle; too big and it blinds a useless
+dead-zone. Connectivity sidesteps size completely: the held object physically
+touches the hand, so its returns form one contiguous component with the gripper.
+We voxelise the non-body returns in the **grasp frame** (`FK(grasp link)` from
+joint encoders → TF, same on hardware), seed at the hand, region-grow the
+26-connected component, and drop it — **any size/shape, no model, no training**,
+and because connectivity is a *per-frame geometric* property it works **while the
+robot is still** (no motion needed, unlike `online`). A separate obstacle is a
+different component and survives.
+
+> **Two catches we found (adversarial review), and the fixes.**
+> 1. **Sparse LiDAR fragments the object.** A single 16-ring scan is too sparse at
+>    close range (~5–7 cm between rings), so the object breaks into disconnected
+>    voxels and leaks. Fix: `connected` builds the component into a **shared
+>    grasp-frame voxel hull**, **fused across sensors** and kept for
+>    `held_connect_ttl` frames — the **dense depth camera** forms a complete hull
+>    that then also clears the sparse **LiDAR** (the cloud feeding `/scan`); TTL
+>    clears it on release. → *LiDAR-only, no camera, `connected` is unreliable —
+>    use `carry_volume`.*
+> 2. **Unbounded growth could carve out a real surface.** A table/wall/person at
+>    near-contact is one connected component with the gripper, so naive region-grow
+>    would flood and delete it — a hole **bigger and more dangerous** than the
+>    sphere. Fix: growth is **capped by a voxel budget** (`held_connect_max_voxels`)
+>    and **fails safe to `carry_volume`** (a bounded sphere) the moment a component
+>    floods past a plausible payload size; the seed is centered on the **contact
+>    point** (not the bare link origin) with a guaranteed nearest-voxel seed; floor
+>    returns (`held_connect_min_z`) and the robot body are excluded so they can't
+>    bridge. Net: `connected` is **never worse than `carry_volume`** in the
+>    dangerous direction — verified, a 2 m wall touching the box drops from 2874 →
+>    309 points removed (just the bounded sphere). (A SAM / segmentation model —
+>    idea #2 — is the camera-only, GPU-heavy alternative noted under *Self-filter*;
+>    connectivity gets the same per-frame segmentation on the camera with no net.)
+
+The demo carries a box held in both hands (`held_object` body in
+`g1_nav_scene.xml`, posed each tick by `g1_sim_node` to track
+`right_wrist_yaw_link`). Toggle to see the problem, the fix, and the modes:
+```bash
+# default: prior-free connectivity removes the payload (any size) -> robot navigates
+ros2 launch g1_nav2_bringup bringup.launch.py
+# payload NOT removed -> robot sees its own load as an obstacle and won't move
+ros2 launch g1_nav2_bringup bringup.launch.py filter_held_object:=false
+# other modes
+ros2 launch g1_nav2_bringup bringup.launch.py held_filter_mode:=carry_volume
+ros2 launch g1_nav2_bringup bringup.launch.py held_filter_mode:=online   # needs motion
+ros2 launch g1_nav2_bringup bringup.launch.py held_filter_mode:=shape    # known primitive
+# carry nothing at all
+ros2 launch g1_nav2_bringup bringup.launch.py hold_object:=false
+```
+Params (`g1_sim_node`): `held_object_parent` (grasp link), `held_object_pos`
+(in-hand grasp point), connectivity: `held_connect_voxel`, `held_connect_seed`,
+`held_connect_max_reach`, `held_connect_max_voxels` (flood budget),
+`held_connect_min_z`, `held_connect_ttl`; sphere: `held_carry_radius`; online:
+`held_voxel`/`held_min_obs`/`held_move_eps`. The `held_object_geom` in the scene
+only sets what the robot *physically carries* — in the prior-free modes the
+filter never reads it.
+
+**Validated** against the simulator geom-id ground truth, for box / cylinder /
+sphere / a long 0.8 m plank the filter was **never told about**, while the robot
+is **stationary**:
+
+| scenario | mode | payload removed | leaked | real world over-removed |
+|----------|------|-----------------|--------|-------------------------|
+| camera, box / plank | `connected` | 100 % | 0 | ~0 |
+| **LiDAR via camera-built hull**, box / plank | `connected` | **100 %** (75/75, 44/44) | **0** | **0** |
+| separated obstacle inside old 0.32 m sphere | `connected` | — | — | obstacle **KEPT** (25/25) ✅ |
+| **2 m wall touching the box** (flood test) | `connected` | (box removed) | — | wall **309/2948** only (fail-safe to sphere; was 2874 unbounded) ✅ |
+| LiDAR-only, no camera | `connected` | partial (fragments) | leaks\* | 0 |
+| long plank | `carry_volume` | only the near 0.32 m | **far end leaks** | 0 |
+
+Cost ≈ 5 ms/scan (LiDAR), ≈45 ms (camera, 19 k pts, dominated by the existing body
+containment stage; connectivity itself is a small BFS bounded by the voxel
+budget). \*The sparse-LiDAR leak is the safe direction (over-cautious, never
+blinds the robot to a real obstacle); it is why the camera hull is fused in, and
+why `carry_volume` is the recommended fallback when no depth camera is available.
+
+**Known limitations / future work** (from the design reviews): connectivity needs
+a dense cloud (camera or motion-accumulated LiDAR); when a payload genuinely
+touches a wall the bounded fail-safe removes only the sphere, so the wall stays an
+obstacle (correct) but the payload's far part leaks until separated; the
+`held_connect_max_voxels` budget trades off "largest carriable object" vs "wall
+flood" — a wardrobe-sized load would trip the fail-safe; ground handling is a flat
+world-z cut (a RANSAC ground plane / height-above-base would be robust on ramps
+and would let low payload parts be removed); capsule carry gates / two-hand grasp
+frames for elongated bimanual loads; per-sensor voxel size (coarser for LiDAR);
+the `online` mode's time-based decay and world-stationarity test.
+
 ## Verified
 - All sensor topics publish; `/lidar/points_raw` (≈2340 pts) vs
   `/lidar/points_self_filtered` (≈1725 pts) → ≈615 self-points removed.

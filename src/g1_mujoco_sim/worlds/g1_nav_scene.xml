@@ -63,5 +63,25 @@
            (and into the URDF camera_joint). -->
       <camera name="rgbd_cam" mode="fixed" xyaxes="0 -1 0  0 0 1" fovy="58"/>
     </body>
+
+    <!-- ===== Held object (payload carried in the hands) =====
+         A box the robot is carrying. Like the sensor mounts above, this is a
+         mocap body whose pose the sim node rewrites every tick so it tracks the
+         grasp link (held_object_parent, default right_wrist_yaw_link) by a fixed
+         grasp offset -- the standard "attached collision object" attached to the
+         gripper. It is DELIBERATELY NOT part of the robot self-model, so by
+         default the LiDAR/camera strike it and nav2 sees an obstacle ~0.3 m in
+         front of the robot -> the robot freezes (the problem when carrying
+         something). Enable the attached-object self-filter
+         (filter_held_object:=true) and the sim removes exactly this volume from
+         the clouds, using only the known grasp pose + payload shape (no sim
+         oracle), so navigation works again.
+         The geom's type/size here are the single source of truth for the filter
+         shape (the sim reads them back); change them to carry a different
+         payload. hold_object:=false parks it underground (robot carries nothing). -->
+    <body name="held_object" mocap="true" pos="0.37 0 0.85">
+      <geom name="held_object_geom" type="box" size="0.10 0.18 0.12"
+            rgba="0.10 0.60 0.90 1" contype="0" conaffinity="0" group="1"/>
+    </body>
   </worldbody>
 </mujoco>

@@ -127,6 +127,63 @@ class G1SimNode(Node):
         self.declare_parameter("publish_self_filtered", True)
         self.declare_parameter("self_filter_margin", 0.04)   # additive padding [m]
         self.declare_parameter("self_filter_scale", 1.0)     # multiplicative scale
+
+        # held object (attached payload). When the robot grasps something, that
+        # object is NOT in the URDF, so the sensors hit it and nav2 treats it as
+        # an obstacle right in front of the robot. Three filter modes, from most
+        # to least prior knowledge (held_filter_mode):
+        #   "shape"        -- known primitive rigidly fixed to the grasp link (a
+        #                     grasp-database / MoveIt AttachedCollisionObject).
+        #                     Requires knowing the object shape in advance.
+        #   "carry_volume" -- PRIOR-FREE. Drop everything inside a fixed region
+        #                     attached to the grasp link (the hand's reach). No
+        #                     object model at all; over-removes a bit near the hand.
+        #   "connected"    -- PRIOR-FREE (default). Remove the point-cloud region
+        #                     that is spatially CONNECTED to the gripper: voxelise
+        #                     the non-body returns, seed at the hand, region-grow
+        #                     the connected component, drop it. The held object
+        #                     touches the hand so it is one contiguous component
+        #                     of ANY size/shape (a broom is removed end to end),
+        #                     with no fixed dead-zone; a separate obstacle is a
+        #                     different component and survives -- even when the
+        #                     robot is stationary (connectivity is per-frame
+        #                     geometry, not temporal persistence).
+        #   "online"       -- PRIOR-FREE. Estimate the payload's occupied volume on
+        #                     the fly: per sensor, transform points into the GRASP
+        #                     frame, keep those in the carry region, and accumulate
+        #                     a persistence voxel model -- but ONLY while the base
+        #                     is actually moving (a rigid payload is stationary in
+        #                     the grasp frame while the world sweeps past; a STILL
+        #                     robot cannot tell its payload from a static obstacle
+        #                     at the hand, so learning is frozen and it falls back
+        #                     to carry_volume). Strictly additive: it can only
+        #                     remove confirmed voxels INSIDE the carry region, never
+        #                     more than carry_volume. Recovers the free space
+        #                     carry_volume wastes, for ANY shape, LiDAR+depth.
+        # Default is connected: size-invariant, prior-free, works while stationary.
+        # carry_volume is a simpler fixed dead-zone; online refines while moving;
+        # shape is best when a grasp-DB primitive exists. All use only the grasp-
+        # link FK pose (own encoders -> TF) + raw returns, so they transfer to
+        # hardware; none consults a simulator oracle.
+        self.declare_parameter("hold_object", True)          # robot carries a payload
+        self.declare_parameter("filter_held_object", True)   # remove it from the clouds
+        self.declare_parameter("held_filter_mode", "connected")  # connected | carry_volume | online | shape
+        self.declare_parameter("held_object_parent", "right_wrist_yaw_link")
+        self.declare_parameter("held_object_pos", [0.17, 0.149, -0.04])   # nominal in-hand grasp point in parent frame [m]
+        self.declare_parameter("held_object_quat", [1.0, 0.0, 0.0, 0.0])  # grasp orientation in parent frame (w,x,y,z); "shape" mode only
+        self.declare_parameter("held_object_margin", 0.05)   # additive padding for the payload filter [m]
+        # connectivity params (connected mode):
+        self.declare_parameter("held_connect_voxel", 0.05)   # connectivity voxel size ~ link tolerance [m]
+        self.declare_parameter("held_connect_seed", 0.15)    # seed radius around the gripper [m]
+        self.declare_parameter("held_connect_max_reach", 1.2)  # candidate gate: ignore returns beyond this from grip [m]
+        self.declare_parameter("held_connect_max_voxels", 800)  # growth budget: bigger component -> flood -> fail safe to carry_volume
+        self.declare_parameter("held_connect_min_z", 0.10)   # ignore returns below this (world z) so the floor can't bridge [m]
+        self.declare_parameter("held_connect_ttl", 12)       # frames a hull voxel survives unseen (cross-sensor fusion / release)
+        # prior-free estimator params (carry_volume / online):
+        self.declare_parameter("held_carry_radius", 0.32)    # carry-region radius around the grasp point [m]
+        self.declare_parameter("held_voxel", 0.03)           # online voxel size [m]
+        self.declare_parameter("held_min_obs", 2)            # online: voxel hits to count as payload
+        self.declare_parameter("held_move_eps", 0.04)        # online: base sweep [m] needed to learn (motion gate)
         # publish the ground-truth self points (.../points_self_gt) from the
         # MuJoCo geom/segmentation ids, for the filter-comparison view.
         self.declare_parameter("publish_truth", True)
@@ -169,6 +226,24 @@ class G1SimNode(Node):
         self.publish_truth = bool(p("publish_truth").value)
         self.self_margin = float(p("self_filter_margin").value)
         self.self_scale = float(p("self_filter_scale").value)
+
+        self.hold_object = bool(p("hold_object").value)
+        self.filter_held_object = bool(p("filter_held_object").value)
+        self.held_mode = str(p("held_filter_mode").value)
+        self.held_parent = p("held_object_parent").value
+        self.held_pos = np.array(p("held_object_pos").value, dtype=float)
+        self.held_quat = np.array(p("held_object_quat").value, dtype=float)
+        self.held_margin = float(p("held_object_margin").value)
+        self.held_connect_voxel = float(p("held_connect_voxel").value)
+        self.held_connect_seed = float(p("held_connect_seed").value)
+        self.held_connect_max_reach = float(p("held_connect_max_reach").value)
+        self.held_connect_max_voxels = int(p("held_connect_max_voxels").value)
+        self.held_connect_min_z = float(p("held_connect_min_z").value)
+        self.held_connect_ttl = int(p("held_connect_ttl").value)
+        self.held_carry_radius = float(p("held_carry_radius").value)
+        self.held_voxel = float(p("held_voxel").value)
+        self.held_min_obs = int(p("held_min_obs").value)
+        self.held_move_eps = float(p("held_move_eps").value)
 
         if not self.scene_xml:
             raise RuntimeError("parameter 'scene_xml' is required")
@@ -256,6 +331,17 @@ class G1SimNode(Node):
         self.get_logger().info("G1 MuJoCo sim node ready.")
 
     # --------------------------------------------------------------------- #
+    def _body_id(self, name):
+        """Body id by name, or None if the scene does not contain it."""
+        i = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name)
+        return i if i >= 0 else None
+
+    def _geom_id(self, name):
+        """Geom id by name, or None if the scene does not contain it."""
+        i = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, name)
+        return i if i >= 0 else None
+
+    # --------------------------------------------------------------------- #
     def _resolve_ids(self):
         m = self.model
         # floating base qpos start
@@ -278,16 +364,69 @@ class G1SimNode(Node):
         self.camera_mocap = m.body_mocapid[self.camera_body]
         self.lidar_site = m.site("lidar_site").id
 
+        # held object (attached payload), if present in the scene. It is a mocap
+        # body like the sensor mounts; the node rewrites its pose every tick.
+        self.held_body = self._body_id("held_object")
+        self.held_geom = self._geom_id("held_object_geom")
+        if self.held_body is not None and self.held_geom is None:
+            self.get_logger().warn("'held_object' body has no 'held_object_geom'; "
+                                   "disabling held-object handling")
+            self.held_body = None
+        if self.held_body is not None:
+            self.held_mocap = m.body_mocapid[self.held_body]
+            self.held_parent_id = m.body(self.held_parent).id
+            # grasp orientation in the parent frame (params, w,x,y,z) as a matrix
+            qn = self.held_quat / (np.linalg.norm(self.held_quat) or 1.0)
+            R = np.empty(9)
+            mujoco.mju_quat2Mat(R, qn)
+            self.held_offR = R.reshape(3, 3)
+            # "shape" mode only: the known primitive (a grasp database / MoveIt
+            # attached collision object). The prior-free modes never read this --
+            # they discover the volume from the returns. Reading the scene geom
+            # here just plays the role of the grasp DB for the "shape" demo.
+            t = int(m.geom_type[self.held_geom])
+            sz = m.geom_size[self.held_geom].astype(float)
+            self.held_shape = {int(mujoco.mjtGeom.mjGEOM_SPHERE): "sphere",
+                               int(mujoco.mjtGeom.mjGEOM_CYLINDER): "cylinder"}.get(t, "box")
+            self.held_size = sz
+        self.has_held = self.hold_object and self.held_body is not None
+
+        # online estimator: one persistence voxel model PER SENSOR (the LiDAR and
+        # camera have different rates/viewpoints, so they must not decay each
+        # other's voxels). _held_reset() (re)initialises them.
+        self._HELD_INC = 1               # reinforce a voxel seen this update
+        self._HELD_DEC = 1               # decay a voxel not seen this update
+        self._HELD_CAP = 10              # max persistence count
+        self._HELD_BOOT = 2              # motion-confirmed updates before the model is trusted
+        self._VOX_NEIGH = np.array(      # 26-neighbourhood (+self) for dilation
+            [[dx, dy, dz] for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)],
+            dtype=np.int64)
+        # int64 voxel-key packing. Only carry-region points (always within
+        # held_carry_radius of the grasp point) are ever packed, so indices stay
+        # tiny and can never reach the +/- _VOX_OFF aliasing range.
+        self._VOX_OFF = 1 << 14
+        self._VOX_M = 1 << 15            # base = 2*OFF; 32768^3 < 2^63, no overflow
+        self.grasp_t = np.zeros(3)       # grasp-link world pose, set each tick
+        self.grasp_R = np.eye(3)
+        self._held_reset()
+
         # real robot link the LiDAR is mounted on
         self.lidar_parent_id = m.body(self.lidar_parent).id
 
         # camera id for rendering
         self.cam_id = m.camera("rgbd_cam").id
 
-        # robot bodies (everything except world + the two mocap mounts) for self filter
+        # robot bodies (everything except world + the mocap mounts) for self
+        # filter. The held object is a mocap body too, and is deliberately NOT a
+        # robot body: it must NOT be caught by the body self-filter (it is not in
+        # the URDF). It is removed only by the separate attached-object filter
+        # below, so that with filter_held_object:=false it stays an obstacle.
         self.robot_bodies = set()
+        skip = {self.lidar_body, self.camera_body}
+        if self.held_body is not None:
+            skip.add(self.held_body)
         for b in range(1, m.nbody):
-            if b in (self.lidar_body, self.camera_body):
+            if b in skip:
                 continue
             self.robot_bodies.add(b)
 
@@ -325,9 +464,26 @@ class G1SimNode(Node):
         # is published on .../points_self_gt for the live filter-comparison view.
         self.geom_is_self = np.zeros(m.ngeom, dtype=bool)
         self.geom_is_self[coll] = True
+        # The payload is "self" (should be removed) for the ground-truth viz only
+        # when we are actually filtering it; otherwise it is a legitimate obstacle.
+        if self.has_held and self.filter_held_object:
+            self.geom_is_self[self.held_geom] = True
         self.get_logger().info(
             f"self-filter: {coll.size} collision geoms "
             f"({self.self_sphere_ids.size} spheres + {len(self.self_local_ids)} other)")
+        if self.held_body is not None:
+            if self.held_mode == "shape":
+                extra = f"shape={self.held_shape} size={np.round(self.held_size[:3], 3).tolist()} "
+            elif self.held_mode == "connected":
+                extra = (f"connect_voxel={self.held_connect_voxel} seed={self.held_connect_seed} "
+                         f"max_reach={self.held_connect_max_reach} ")
+            else:
+                extra = f"carry_r={self.held_carry_radius} voxel={self.held_voxel} "
+            self.get_logger().info(
+                f"held object: hold={self.has_held} filter={self.filter_held_object} "
+                f"mode={self.held_mode} {extra}"
+                f"on '{self.held_parent}' grasp_pt={np.round(self.held_pos, 3).tolist()} "
+                f"(prior-free unless mode=shape)")
 
         # geomgroup mask: include groups 0,1; exclude group 2 (sensor markers)
         self.geomgroup = np.array([1, 1, 0, 1, 1, 1], dtype=np.uint8)
@@ -391,6 +547,33 @@ class G1SimNode(Node):
         self.lidar_origin = pp + pR @ self.lidar_off
         d.mocap_pos[self.lidar_mocap] = self.lidar_origin
         d.mocap_quat[self.lidar_mocap] = mat2quat(pR)
+
+        # held object: rigidly attached to the grasp link. Its world pose is the
+        # grasp link's FK pose composed with the fixed grasp offset -- exactly the
+        # transform a real robot has (link TF from joint encoders o known grasp).
+        # The SAME pose feeds both the rendered/raycast geom (mocap) and the
+        # attached-object self-filter, so the removed volume matches what the
+        # sensors see, with no simulator oracle.
+        if self.held_body is not None:
+            if self.has_held:
+                hp = d.xpos[self.held_parent_id].copy()
+                hR = d.xmat[self.held_parent_id].reshape(3, 3).copy()
+                # grasp-link world pose -- the frame the prior-free filter works
+                # in (a real robot gets this from joint encoders -> TF).
+                self.grasp_t = hp
+                self.grasp_R = hR
+                self.held_c = hp + hR @ self.held_pos
+                self.held_R = hR @ self.held_offR
+                d.mocap_pos[self.held_mocap] = self.held_c
+                d.mocap_quat[self.held_mocap] = mat2quat(self.held_R)
+            else:
+                # not carrying anything: park the payload far underground / out of
+                # every sensor's view so it neither renders nor is raycast, and
+                # clear any online model so the next grasp starts clean (release).
+                d.mocap_pos[self.held_mocap] = [0.0, 0.0, -10.0]
+                if self._held_models["lidar"]["obj_keys"].size or \
+                        self._held_models["camera"]["obj_keys"].size:
+                    self._held_reset()
 
         # camera mount: base-relative, orientation = yaw then pitch-down about Y
         c, s = math.cos(self.base_yaw), math.sin(self.base_yaw)
@@ -511,7 +694,7 @@ class G1SimNode(Node):
         if self.publish_self_filtered:
             # world points = origin + R @ local; test against the body model.
             world_pts = self.lidar_origin + pts.astype(np.float64) @ self.lidar_R.T
-            keep = self._self_filter_keep(world_pts)
+            keep = self._self_filter_keep(world_pts, "lidar")
             self.pub_lidar_filt.publish(self._cloud(header_stamp, self.lidar_frame, pts[keep]))
 
     # --------------------------------------------------------------------- #
@@ -572,11 +755,11 @@ class G1SimNode(Node):
             cam_R = self.data.cam_xmat[self.cam_id].reshape(3, 3)
             p_cam = pts.astype(np.float64) * np.array([1.0, -1.0, -1.0])
             world_pts = cam_pos + p_cam @ cam_R.T
-            keep = self._self_filter_keep(world_pts)
+            keep = self._self_filter_keep(world_pts, "camera")
             self.pub_cam_filt.publish(self._cloud(stamp, self.camera_frame, pts[keep]))
 
     # --------------------------------------------------------------------- #
-    def _self_filter_keep(self, world_pts):
+    def _self_filter_keep(self, world_pts, sensor="lidar"):
         """Geometric self-filter: True for points to KEEP (not on the robot).
 
         Point-in-shape containment against the robot's collision geometry at the
@@ -630,7 +813,260 @@ class G1SimNode(Node):
             else:  # unknown type -> conservative bounding sphere
                 r = self.model.geom_rbound[g] * sc + pad
                 inside |= (loc ** 2).sum(1) <= r * r
+
+        # attached payload: an extra carried object, removed by a separate filter
+        # (connectivity to the gripper, known shape, conservative carry volume, or
+        # a prior-free online voxel estimate) -- see _held_inside.
+        inside |= self._held_inside(P, sensor, inside)
         return ~inside
+
+    # --------------------------------------------------------------------- #
+    def _held_inside(self, P, sensor, body_inside):
+        """Mask (True = drop) of points that belong to the carried payload.
+
+        ``held_filter_mode`` picks how much prior knowledge is used:
+
+          "connected"    -- PRIOR-FREE: drop the point-cloud region spatially
+                            connected to the gripper (region-grow). Size-invariant
+                            and works while stationary. (Needs body_inside to know
+                            which points are the robot vs candidates.)
+          "shape"        -- a known primitive (grasp DB / attached collision
+                            object). Needs the object shape in advance.
+          "carry_volume" -- PRIOR-FREE: drop the whole carry region around the
+                            hand. No object model; over-removes near the hand.
+          "online"       -- PRIOR-FREE: drop points whose grasp-frame voxel is in
+                            a per-sensor persistence model learned ONLY while the
+                            base moves. Strictly additive.
+
+        Uses only the grasp-link FK pose + the raw returns -- transfers to a real
+        robot and never consults a simulator oracle.
+        """
+        n = P.shape[0]
+        if n == 0 or not (self.has_held and self.filter_held_object):
+            return np.zeros(n, dtype=bool)
+
+        if self.held_mode == "connected":
+            return self._held_connected(P, body_inside)
+
+        Pg = (P - self.grasp_t) @ self.grasp_R          # world -> grasp frame
+
+        if self.held_mode == "shape":
+            loc = (Pg - self.held_pos) @ self.held_offR
+            sz, pad = self.held_size, self.held_margin
+            if self.held_shape == "sphere":
+                r = sz[0] + pad
+                return (loc ** 2).sum(1) <= r * r
+            if self.held_shape == "cylinder":
+                r, hl = sz[0] + pad, sz[1] + pad
+                return (np.abs(loc[:, 2]) <= hl) & ((loc[:, :2] ** 2).sum(1) <= r * r)
+            half = sz[:3] + pad
+            return (np.abs(loc) <= half).all(axis=1)
+
+        # prior-free: a carry region attached to the hand bounds what can ever be
+        # called "held" (own kinematics, not the object). Centred on the nominal
+        # grasp point in the grasp frame.
+        dc = Pg - self.held_pos
+        in_region = (dc * dc).sum(1) <= self.held_carry_radius ** 2
+
+        if self.held_mode == "carry_volume":
+            return in_region
+        return self._held_online(Pg, in_region, sensor)
+
+    # --------------------------------------------------------------------- #
+    def _held_online(self, Pg, in_region, sensor):
+        """Prior-free online payload estimate (per sensor, motion-gated).
+
+        Online may only LEARN while the base actually sweeps relative to the
+        world: a rigid payload is stationary in the grasp frame while the world
+        moves through it, but a STILL robot cannot distinguish its payload from a
+        static obstacle at the hand. So below a motion threshold the model is
+        frozen (no voxel is baked from a static obstacle) and, until a model is
+        motion-confirmed, removal falls back to the full carry region. Removal is
+        strictly additive: only confirmed voxels INSIDE the carry region are
+        dropped -- never more than carry_volume, never anything outside the gate.
+        """
+        st = self._held_models[sensor]
+        moved = True
+        if st["last_t"] is not None:
+            dtrans = float(np.linalg.norm(self.grasp_t - st["last_t"]))
+            dR = st["last_R"].T @ self.grasp_R
+            ang = math.acos(max(-1.0, min(1.0, (np.trace(dR) - 1.0) * 0.5)))
+            moved = (dtrans + ang * self.held_carry_radius) > self.held_move_eps
+        if moved:                                       # learn only when sweeping
+            self._held_model_update(st, Pg[in_region])
+            st["last_t"] = self.grasp_t.copy()
+            st["last_R"] = self.grasp_R.copy()
+
+        if not (st["obs_frames"] > self._HELD_BOOT and st["obj_keys"].size):
+            return in_region                            # no trusted model -> carry volume
+
+        # tight: drop only in-region points whose voxel is a confirmed payload
+        # voxel. Query in-region points only -- they are within carry_radius, so
+        # their voxel indices stay tiny (no int64 key aliasing) and it is cheap.
+        remove = np.zeros(Pg.shape[0], dtype=bool)
+        idx = np.where(in_region)[0]
+        if idx.size:
+            hit = np.isin(self._vox_pack(self._vox_ijk(Pg[idx])), st["obj_keys"])
+            remove[idx[hit]] = True
+        return remove
+
+    def _held_reset(self):
+        """(Re)initialise the held-object models (also call on release)."""
+        self._held_models = {s: {"count": {}, "obj_keys": np.empty(0, np.int64),
+                                 "obs_frames": 0, "last_t": None, "last_R": None}
+                             for s in ("lidar", "camera")}
+        # connected mode: shared GRASP-FRAME voxel hull {packed key -> last tick}.
+        # Built by connectivity on each cloud and shared across sensors so the
+        # dense camera's hull also clears the sparse LiDAR; the TTL clears it on
+        # release. Grasp-frame keys are stable as the base moves.
+        self._held_hull = {}
+
+    # --------------------------------------------------------------------- #
+    def _held_connected(self, P, body_inside):
+        """Prior-free, size-invariant payload removal by CONNECTIVITY to the hand.
+
+        The held object physically touches the gripper, so its returns form one
+        spatially-contiguous component with the hand. Each cloud is voxelised in
+        the GRASP frame; we seed at the gripper, region-grow the 26-connected
+        component, and add it to a shared grasp-frame voxel **hull**. Points
+        (this cloud) whose grasp-frame voxel is in the hull are dropped. This
+        removes an object of ANY size/shape end-to-end with no fixed dead-zone,
+        and -- connectivity being a per-frame geometric property, not temporal
+        persistence -- it works while the robot is stationary; a separate obstacle
+        is a different component and is kept.
+
+        The hull is shared across sensors and kept for ``held_connect_ttl`` frames:
+        the **dense depth camera** builds a complete hull that then also clears the
+        **sparse LiDAR** (whose own single scan is too thin to stay connected),
+        and the TTL clears the hull on release. Grasp-frame keys are stable as the
+        base moves, so the hull tracks the hand.
+
+        Safeguards: candidates exclude the robot body (growth can't run through it)
+        and floor returns below ``held_connect_min_z`` (the ground can't bridge the
+        object to the world); everything is capped at ``held_connect_max_reach``
+        from the grip, so a stray bridge can only ever delete a bounded blob.
+        """
+        n = P.shape[0]
+        v = self.held_connect_voxel
+        reach2 = self.held_connect_max_reach ** 2
+
+        # bounded carry-volume fail-safe (used when connectivity is untrustworthy:
+        # empty seed, or a flood that exceeds the voxel budget). Removes only the
+        # fixed sphere at the hand -- never floods a wall/table.
+        def carry_fallback():
+            Pg_all = (P - self.grasp_t) @ self.grasp_R
+            return ((Pg_all - self.held_pos) ** 2).sum(1) <= self.held_carry_radius ** 2
+
+        # candidates = non-body, non-floor returns within reach of the grip,
+        # expressed in the grasp frame (where the hull lives).
+        cand = (~body_inside) & (P[:, 2] >= self.held_connect_min_z)
+        ci = np.where(cand)[0]
+        if ci.size:
+            Pg = (P[ci] - self.grasp_t) @ self.grasp_R
+            keep = (Pg ** 2).sum(1) <= reach2
+            ci, Pg = ci[keep], Pg[keep]
+        if ci.size == 0:
+            return carry_fallback()
+
+        # voxelise in the grasp frame; SEED ON THE CONTACT POINT (held_pos), not
+        # the bare link origin, so the seed reaches the object for any grasp
+        # offset, and guarantee at least the nearest candidate voxel.
+        ijk = np.floor(Pg / v).astype(np.int64)
+        keys = [(int(a), int(b), int(c)) for a, b, c in ijk]
+        occupied = set(keys)
+        dseed = ((Pg - self.held_pos) ** 2).sum(1)
+        seed = {k for k, near in zip(keys, dseed <= self.held_connect_seed ** 2) if near}
+        seed &= occupied
+        if not seed:
+            seed = {keys[int(np.argmin(dseed))]}
+
+        # region-grow the 26-connected component, but ABORT to the bounded
+        # fallback if it floods past a plausible held-object voxel budget -- a
+        # table/shelf/wall/person at near-contact is one component with the grip
+        # and would otherwise be silently carved out of the costmap.
+        comp, stack, neigh = set(), list(seed), self._VOX_NEIGH.tolist()
+        budget = self.held_connect_max_voxels
+        while stack:
+            k = stack.pop()
+            if k in comp:
+                continue
+            comp.add(k)
+            if len(comp) > budget:                          # flood -> fail safe
+                return carry_fallback()
+            kx, ky, kz = k
+            for dx, dy, dz in neigh:
+                nk = (kx + dx, ky + dy, kz + dz)
+                if nk in occupied and nk not in comp:
+                    stack.append(nk)
+
+        for k in comp:                                      # refresh hull (grasp frame)
+            self._held_hull[k] = self.tick
+        # expire stale hull voxels (release / cross-sensor TTL).
+        self._held_hull = {k: t for k, t in self._held_hull.items()
+                           if self.tick - t <= self.held_connect_ttl}
+
+        # drop candidate points whose grasp-frame voxel is in the (dilated) hull.
+        held = np.zeros(n, dtype=bool)
+        if self._held_hull:
+            o, M = self._VOX_OFF, self._VOX_M
+            hull = self._vox_dilate(np.fromiter(
+                ((kx + o) + (ky + o) * M + (kz + o) * (M * M)
+                 for kx, ky, kz in self._held_hull), dtype=np.int64, count=-1))
+            q = self._vox_pack(np.floor(Pg / v).astype(np.int64))
+            held[ci] = np.isin(q, hull)
+        return held
+
+    # --------------------------------------------------------------------- #
+    def _vox_ijk(self, Pg):
+        """Grasp-frame points -> integer voxel indices (N,3)."""
+        return np.floor(Pg / self.held_voxel).astype(np.int64)
+
+    def _vox_pack(self, ijk):
+        """Voxel indices -> packed int64 keys (mixed-radix, all axes >= 0)."""
+        o, M = self._VOX_OFF, self._VOX_M
+        return (ijk[:, 0] + o) + (ijk[:, 1] + o) * M + (ijk[:, 2] + o) * (M * M)
+
+    def _vox_unpack(self, keys):
+        """Packed int64 keys -> voxel indices (K,3)."""
+        o, M = self._VOX_OFF, self._VOX_M
+        iz, rem = np.divmod(keys, M * M)
+        iy, ix = np.divmod(rem, M)
+        return np.stack([ix - o, iy - o, iz - o], axis=1)
+
+    def _held_model_update(self, st, cand):
+        """Update one sensor's grasp-frame persistence voxel model from candidates.
+
+        Voxels seen this update are reinforced (+1, capped); voxels not seen decay
+        (-1) and are dropped at 0. A rigidly-held object is seen every (moving)
+        update so it climbs above ``held_min_obs``; transient world points that
+        drift through the carry region never persist. The object-voxel set is
+        dilated by one voxel for margin. Called only when the base is moving.
+        """
+        st["obs_frames"] += 1
+        cnt = st["count"]
+        ck = (np.unique(self._vox_pack(self._vox_ijk(cand)))
+              if cand.shape[0] else np.empty(0, dtype=np.int64))
+        seen = set(ck.tolist())
+        for k in list(cnt.keys()):                    # decay voxels not seen now
+            if k not in seen:
+                v = cnt[k] - self._HELD_DEC
+                if v <= 0:
+                    del cnt[k]
+                else:
+                    cnt[k] = v
+        for k in seen:                                # reinforce voxels seen now
+            cnt[k] = min(self._HELD_CAP, cnt.get(k, 0) + self._HELD_INC)
+        obj = np.fromiter((k for k, v in cnt.items() if v >= self.held_min_obs),
+                          dtype=np.int64, count=-1)
+        st["obj_keys"] = self._vox_dilate(obj)
+
+    def _vox_dilate(self, keys):
+        """Add the 26-neighbourhood to a set of packed voxel keys (1-voxel margin)."""
+        if keys.size == 0:
+            return keys
+        ijk = self._vox_unpack(keys)                  # (K,3)
+        d = (ijk[:, None, :] + self._VOX_NEIGH[None, :, :]).reshape(-1, 3)
+        return np.unique(self._vox_pack(d))
 
     # --------------------------------------------------------------------- #
     @staticmethod

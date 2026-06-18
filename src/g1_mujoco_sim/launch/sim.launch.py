@@ -34,6 +34,9 @@ def generate_launch_description():
 
     use_viewer = LaunchConfiguration("use_viewer")
     use_body_filter = LaunchConfiguration("use_body_filter")
+    hold_object = LaunchConfiguration("hold_object")
+    filter_held_object = LaunchConfiguration("filter_held_object")
+    held_filter_mode = LaunchConfiguration("held_filter_mode")
 
     # When robot_body_filter is on, scan comes from its output; otherwise the
     # sim's internal self-filtered cloud.
@@ -50,6 +53,16 @@ def generate_launch_description():
                               description="Launch the MuJoCo passive viewer"),
         DeclareLaunchArgument("use_body_filter", default_value="false",
                               description="Use robot_body_filter instead of the sim's built-in self-filter"),
+        DeclareLaunchArgument("hold_object", default_value="true",
+                              description="Robot carries a payload box in its hands"),
+        DeclareLaunchArgument("filter_held_object", default_value="true",
+                              description="Remove the carried payload from the sensor clouds "
+                                          "(false -> payload is seen as an obstacle and the robot freezes)"),
+        DeclareLaunchArgument("held_filter_mode", default_value="connected",
+                              description="How the payload is filtered: connected (prior-free, "
+                                          "size-invariant, region-grow from the hand, default) | "
+                                          "carry_volume (fixed hand region) | online (voxel "
+                                          "estimate, needs motion) | shape (known primitive)"),
 
         Node(
             package="robot_state_publisher",
@@ -66,6 +79,9 @@ def generate_launch_description():
             parameters=[{
                 "scene_xml": scene_xml,
                 "use_viewer": use_viewer,
+                "hold_object": hold_object,
+                "filter_held_object": filter_held_object,
+                "held_filter_mode": held_filter_mode,
             }],
         ),
 

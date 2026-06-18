@@ -30,12 +30,23 @@ def generate_launch_description():
     use_viewer = LaunchConfiguration("use_viewer")
     use_rviz = LaunchConfiguration("use_rviz")
     use_filter_viz = LaunchConfiguration("use_filter_viz")
+    hold_object = LaunchConfiguration("hold_object")
+    filter_held_object = LaunchConfiguration("filter_held_object")
+    held_filter_mode = LaunchConfiguration("held_filter_mode")
 
     return LaunchDescription([
         DeclareLaunchArgument("use_viewer", default_value="true"),
         DeclareLaunchArgument("use_rviz", default_value="true"),
         DeclareLaunchArgument("use_filter_viz", default_value="true",
                               description="Live ground-truth-vs-self-filter window"),
+        DeclareLaunchArgument("hold_object", default_value="true",
+                              description="Robot carries a payload box in its hands"),
+        DeclareLaunchArgument("filter_held_object", default_value="true",
+                              description="Remove the carried payload from the clouds "
+                                          "(false -> robot sees its own payload as an obstacle)"),
+        DeclareLaunchArgument("held_filter_mode", default_value="connected",
+                              description="connected (prior-free, size-invariant, default) | "
+                                          "carry_volume | online (needs motion) | shape"),
 
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
@@ -44,6 +55,9 @@ def generate_launch_description():
                 "use_viewer": use_viewer,
                 # bringup self-filters with the sim's built-in geometric filter.
                 "use_body_filter": "false",
+                "hold_object": hold_object,
+                "filter_held_object": filter_held_object,
+                "held_filter_mode": held_filter_mode,
             }.items(),
         ),
 
