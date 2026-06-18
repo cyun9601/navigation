@@ -11,6 +11,9 @@ Args:
     use_viewer:=true|false        MuJoCo passive viewer (default true)
     use_rviz:=true|false          RViz (default true)
     use_filter_viz:=true|false    live ground-truth-vs-filter window (default true)
+    use_filter_metrics:=true|false  headless held-filter scorer (default true)
+    payload:=box|sphere|cylinder|pole|board|lshape   carried object SHAPE to test
+                                  the prior-free held-object filter (default box)
 """
 import os
 
@@ -30,15 +33,20 @@ def generate_launch_description():
     use_viewer = LaunchConfiguration("use_viewer")
     use_rviz = LaunchConfiguration("use_rviz")
     use_filter_viz = LaunchConfiguration("use_filter_viz")
+    use_filter_metrics = LaunchConfiguration("use_filter_metrics")
     hold_object = LaunchConfiguration("hold_object")
     filter_held_object = LaunchConfiguration("filter_held_object")
     held_filter_mode = LaunchConfiguration("held_filter_mode")
+    payload = LaunchConfiguration("payload")
 
     return LaunchDescription([
         DeclareLaunchArgument("use_viewer", default_value="true"),
         DeclareLaunchArgument("use_rviz", default_value="true"),
         DeclareLaunchArgument("use_filter_viz", default_value="true",
                               description="Live ground-truth-vs-self-filter window"),
+        DeclareLaunchArgument("use_filter_metrics", default_value="true",
+                              description="Headless held-object filter scorer "
+                                          "(payload leak / over-removal per object)"),
         DeclareLaunchArgument("hold_object", default_value="true",
                               description="Robot carries a payload box in its hands"),
         DeclareLaunchArgument("filter_held_object", default_value="true",
@@ -47,6 +55,10 @@ def generate_launch_description():
         DeclareLaunchArgument("held_filter_mode", default_value="connected",
                               description="connected (prior-free, size-invariant, default) | "
                                           "carry_volume | online (needs motion) | shape"),
+        DeclareLaunchArgument("payload", default_value="box",
+                              description="Carried object SHAPE for testing the prior-free "
+                                          "held-object filter: box | sphere | cylinder | pole | "
+                                          "board | lshape (or 'scene' to keep the XML geom)"),
 
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
@@ -58,6 +70,7 @@ def generate_launch_description():
                 "hold_object": hold_object,
                 "filter_held_object": filter_held_object,
                 "held_filter_mode": held_filter_mode,
+                "payload": payload,
             }.items(),
         ),
 
@@ -74,5 +87,16 @@ def generate_launch_description():
             executable="self_filter_viz_node",
             name="self_filter_viz",
             output="screen",
+        ),
+
+        # Headless scorer: payload leak / over-removal per carried object, so the
+        # prior-free held-object filter can be compared across payload shapes.
+        Node(
+            condition=IfCondition(use_filter_metrics),
+            package="g1_mujoco_sim",
+            executable="held_filter_metrics_node",
+            name="held_filter_metrics",
+            output="screen",
+            parameters=[{"payload": payload}],
         ),
     ])

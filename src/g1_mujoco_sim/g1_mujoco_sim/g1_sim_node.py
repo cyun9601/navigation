@@ -168,6 +168,13 @@ class G1SimNode(Node):
         self.declare_parameter("hold_object", True)          # robot carries a payload
         self.declare_parameter("filter_held_object", True)   # remove it from the clouds
         self.declare_parameter("held_filter_mode", "connected")  # connected | carry_volume | online | shape
+        # which payload SHAPE the robot carries, for testing the filter against a
+        # variety of objects without hand-editing the scene. A preset name
+        # (box | sphere | cylinder | pole | board | lshape; see held_objects.py)
+        # rewrites the held_object body's geom(s) at load; "scene" keeps the geom
+        # already in the XML. The prior-free filter modes never read this -- it
+        # only sets what the robot physically carries (i.e. what the sensors hit).
+        self.declare_parameter("held_object_preset", "box")
         self.declare_parameter("held_object_parent", "right_wrist_yaw_link")
         self.declare_parameter("held_object_pos", [0.17, 0.149, -0.04])   # nominal in-hand grasp point in parent frame [m]
         self.declare_parameter("held_object_quat", [1.0, 0.0, 0.0, 0.0])  # grasp orientation in parent frame (w,x,y,z); "shape" mode only
@@ -230,6 +237,7 @@ class G1SimNode(Node):
         self.hold_object = bool(p("hold_object").value)
         self.filter_held_object = bool(p("filter_held_object").value)
         self.held_mode = str(p("held_filter_mode").value)
+        self.held_preset = str(p("held_object_preset").value)
         self.held_parent = p("held_object_parent").value
         self.held_pos = np.array(p("held_object_pos").value, dtype=float)
         self.held_quat = np.array(p("held_object_quat").value, dtype=float)
@@ -249,8 +257,25 @@ class G1SimNode(Node):
             raise RuntimeError("parameter 'scene_xml' is required")
 
         # ---- load model ----
+        # Optionally swap the carried payload's shape (held_object_preset): the
+        # held_object body's geom(s) are replaced via MuJoCo's model editor, so we
+        # can test the prior-free filter against many shapes without editing the
+        # XML. "scene" keeps whatever geom is already in g1_nav_scene.xml.
+        from g1_mujoco_sim import held_objects
         self.get_logger().info(f"loading MuJoCo scene: {self.scene_xml}")
-        self.model = mujoco.MjModel.from_xml_path(self.scene_xml)
+        if held_objects.is_scene_keyword(self.held_preset):
+            self.model = mujoco.MjModel.from_xml_path(self.scene_xml)
+        else:
+            try:
+                self.model = held_objects.build_model(self.scene_xml, self.held_preset)
+                self.get_logger().info(
+                    f"payload preset '{self.held_preset}': "
+                    f"{held_objects.PRESETS[self.held_preset]['desc']}")
+            except Exception as e:
+                self.get_logger().error(
+                    f"payload preset '{self.held_preset}' failed ({e}); "
+                    f"using scene XML as-is")
+                self.model = mujoco.MjModel.from_xml_path(self.scene_xml)
         self.data = mujoco.MjData(self.model)
 
         self._resolve_ids()
@@ -315,6 +340,10 @@ class G1SimNode(Node):
         self.pub_lidar_filt = self.create_publisher(PointCloud2, "lidar/points_self_filtered", sensor_qos)
         if self.publish_truth:
             self.pub_lidar_self_gt = self.create_publisher(PointCloud2, "lidar/points_self_gt", sensor_qos)
+            # payload-only ground truth (the returns that hit the held object),
+            # so the metrics node can score held-object filtering on its own.
+            if self.held_body is not None:
+                self.pub_lidar_held_gt = self.create_publisher(PointCloud2, "lidar/points_held_gt", sensor_qos)
         if self.enable_camera:
             self.pub_rgb = self.create_publisher(Image, "camera/color/image_raw", sensor_qos)
             self.pub_depth = self.create_publisher(Image, "camera/depth/image_raw", sensor_qos)
@@ -323,6 +352,8 @@ class G1SimNode(Node):
             self.pub_cam_filt = self.create_publisher(PointCloud2, "camera/points_self_filtered", sensor_qos)
             if self.publish_truth:
                 self.pub_cam_self_gt = self.create_publisher(PointCloud2, "camera/points_self_gt", sensor_qos)
+                if self.held_body is not None:
+                    self.pub_cam_held_gt = self.create_publisher(PointCloud2, "camera/points_held_gt", sensor_qos)
 
         self.sub_cmd = self.create_subscription(Twist, "cmd_vel", self._cmd_cb, 10)
 
@@ -389,6 +420,19 @@ class G1SimNode(Node):
             self.held_shape = {int(mujoco.mjtGeom.mjGEOM_SPHERE): "sphere",
                                int(mujoco.mjtGeom.mjGEOM_CYLINDER): "cylinder"}.get(t, "box")
             self.held_size = sz
+            # ALL geoms of the payload body (a preset may be multi-geom, e.g. an
+            # L-shape). Used to mark payload returns as ground truth; the prior-
+            # free filters still discover the volume from the returns themselves.
+            self.held_geoms = np.array(
+                [g for g in range(m.ngeom) if m.geom_bodyid[g] == self.held_body],
+                dtype=np.int32)
+            if self.held_mode == "shape" and self.held_geoms.size > 1:
+                self.get_logger().warn(
+                    "held_filter_mode='shape' models only the primary geom; this "
+                    f"payload has {self.held_geoms.size} geoms -- use a prior-free "
+                    "mode (connected/carry_volume/online) for multi-part objects")
+        else:
+            self.held_geoms = np.zeros(0, dtype=np.int32)
         self.has_held = self.hold_object and self.held_body is not None
 
         # online estimator: one persistence voxel model PER SENSOR (the LiDAR and
@@ -467,7 +511,12 @@ class G1SimNode(Node):
         # The payload is "self" (should be removed) for the ground-truth viz only
         # when we are actually filtering it; otherwise it is a legitimate obstacle.
         if self.has_held and self.filter_held_object:
-            self.geom_is_self[self.held_geom] = True
+            self.geom_is_self[self.held_geoms] = True
+        # payload-only ground truth (always, regardless of the filter flag): which
+        # geoms ARE the held object, for the held-object metrics / .../points_held_gt.
+        self.geom_is_held = np.zeros(m.ngeom, dtype=bool)
+        if self.held_geoms.size:
+            self.geom_is_held[self.held_geoms] = True
         self.get_logger().info(
             f"self-filter: {coll.size} collision geoms "
             f"({self.self_sphere_ids.size} spheres + {len(self.self_local_ids)} other)")
@@ -688,9 +737,14 @@ class G1SimNode(Node):
         if self.publish_truth:
             # ground truth: which hit points struck a robot-body geom. Aligned
             # with `pts` (same hit mask), so coordinates match the raw cloud.
-            gt_self = self.geom_is_self[self._ray_geomid[hit]]
+            hit_geoms = self._ray_geomid[hit]
+            gt_self = self.geom_is_self[hit_geoms]
             self.pub_lidar_self_gt.publish(
                 self._cloud(header_stamp, self.lidar_frame, pts[gt_self]))
+            if self.held_body is not None:
+                gt_held = self.geom_is_held[hit_geoms]
+                self.pub_lidar_held_gt.publish(
+                    self._cloud(header_stamp, self.lidar_frame, pts[gt_held]))
         if self.publish_self_filtered:
             # world points = origin + R @ local; test against the body model.
             world_pts = self.lidar_origin + pts.astype(np.float64) @ self.lidar_R.T
@@ -748,6 +802,10 @@ class G1SimNode(Node):
             hit_pix = seg_sub >= 0                       # -1 == background (no geom)
             gt_self[hit_pix] = self.geom_is_self[seg_sub[hit_pix]]
             self.pub_cam_self_gt.publish(self._cloud(stamp, self.camera_frame, pts[gt_self]))
+            if self.held_body is not None:
+                gt_held = np.zeros(pts.shape[0], dtype=bool)
+                gt_held[hit_pix] = self.geom_is_held[seg_sub[hit_pix]]
+                self.pub_cam_held_gt.publish(self._cloud(stamp, self.camera_frame, pts[gt_held]))
 
         if self.publish_self_filtered:
             # optical (x right, y down, z fwd) -> MuJoCo cam (x right, y up, z back)

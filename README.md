@@ -203,6 +203,79 @@ ros2 launch g1_nav2_bringup bringup.launch.py held_filter_mode:=shape    # known
 # carry nothing at all
 ros2 launch g1_nav2_bringup bringup.launch.py hold_object:=false
 ```
+
+### Testing varied payload shapes (`payload:=…`)
+The whole point is that the prior-free filter is **never told the shape**, so test
+it against many. `payload:=<preset>` swaps the geom of the carried object at load
+(no XML editing); the filter still discovers it from the LiDAR/RGBD returns alone.
+Presets are in [`held_objects.py`](src/g1_mujoco_sim/g1_mujoco_sim/held_objects.py):
+
+| preset | object (grip) | why it's interesting |
+|--------|--------------|----------------------|
+| `box` (default) | compact box (both hands) | the baseline payload |
+| `sphere` | ball r=0.13 m (both hands) | rounded surface |
+| `cylinder` | upright canister (right hand) | curved + flat ends, one-handed |
+| `pole` | ~1 m rod through the right hand, pointing forward | far end reaches well past the `carry_volume` radius → shows `connected` removing it end-to-end where `carry_volume` leaves a phantom tip |
+| `board` | flat tray held level in both hands | broad near-field surface in front of the depth camera |
+| `lshape` | non-convex two-box L (right hand) | multi-geom; no single primitive describes it |
+
+Each preset is placed so a hand actually closes on it (the grasp point is on the
+body midline ~0.17 m in front of the wrists, so thin objects are set at the right
+hand and wide ones span both hands — otherwise they float between the hands).
+
+```bash
+ros2 launch g1_nav2_bringup bringup.launch.py payload:=pole
+ros2 launch g1_nav2_bringup bringup.launch.py payload:=lshape held_filter_mode:=carry_volume
+```
+
+A headless scorer, `held_filter_metrics_node` (on by default;
+`use_filter_metrics:=false` to disable), prints per-object numbers every few
+seconds from the published ground truth — the payload's own returns
+(`/<sensor>/points_held_gt`) vs the filtered cloud:
+
+```
+===== held-filter metrics   payload='pole' =====
+ camera  frames=37  avg_raw=18994
+   payload : seen=2731   left-in=0     ->  0.00%  [want <= 5.00%]   # carried object removed
+   over-rm : world=15803 removed=4     ->  0.03%  [want <= 2.00%]   # real obstacles kept
+   body    : seen=4112   left-in=0     ->  0.00%
+   verdict : PASS
+```
+
+`payload leak` = carried-object returns the filter left in as a phantom obstacle
+(want 0); `over-removal` = real-world returns it wrongly deleted (want ~0). PASS
+when both are under the `max_payload_leak` / `max_over_removal` params. Run
+`carry_volume` against `pole`/`board` to watch the far end leak, then `connected`
+to watch it disappear.
+
+Verified steady-state (`connected` mode, robot stationary; sliding-window numbers
+from `held_filter_metrics_node`, both sensors):
+
+| payload | payload leak (cam / LiDAR) | over-removal | verdict |
+|---------|----------------------------|--------------|---------|
+| `box` | 0 % / 0 % | ~0 % | PASS |
+| `sphere` | 0 % / ~0 % | ~0 % | PASS |
+| `cylinder` | ~0 % / 0 % | ~0 % | PASS |
+| `pole` | 0 % / 0 % | ~0 % | PASS |
+| `board` | 0 % / 0 % | ~0 % | PASS |
+| `lshape` | 0 % / 0 % | ~0 % | PASS |
+
+**Every shape is removed cleanly.** The `connected` region-grow captures only the
+component touching the hand: instrumenting the grow shows the component is exactly
+the held object (e.g. a flat tray → 44 grasp-frame voxels at the tray's height; an
+L → 18 voxels at the L) and *never reaches the floor* — the floor (world z below
+`held_connect_min_z`) and the robot body are excluded as candidates, so the
+ground can't join the object's component. Over-removal stays ~0 %: the only world
+points dropped are a handful at the object's surface (the hull's one-voxel,
+0.05 m dilation margin). The dense depth camera removes the object completely; the
+sparse LiDAR can leave a few stray fragments of rounded payloads (the *safe*
+over-cautious direction — it never deletes a real obstacle).
+
+> Measurement note: trust a *synchronized* comparison of the raw / GT / filtered
+> clouds (what `held_filter_metrics_node` does) and a *sliding window* rather than
+> a cumulative average — a cumulative mean never forgets the brief boot transient
+> while the cross-sensor hull fills, and an unsynchronized cloud grab matches
+> mismatched frames; both make a clean filter look like it floods.
 Params (`g1_sim_node`): `held_object_parent` (grasp link), `held_object_pos`
 (in-hand grasp point), connectivity: `held_connect_voxel`, `held_connect_seed`,
 `held_connect_max_reach`, `held_connect_max_voxels` (flood budget),

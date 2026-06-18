@@ -11,6 +11,12 @@ Self-filter selection:
         (/lidar/points_self_filtered, /camera/points_self_filtered)
   use_body_filter:=true            -> robot_body_filter nodes
         (/lidar/points_filtered,     /camera/points_filtered)
+
+Held-object testing:
+  payload:=box|sphere|cylinder|pole|board|lshape  -> the SHAPE the robot carries
+        (default box; 'scene' keeps the geom in g1_nav_scene.xml). The prior-free
+        held-object filter is never told the shape; this just swaps what it must
+        discover from the LiDAR/RGBD returns.
 """
 import os
 
@@ -37,6 +43,7 @@ def generate_launch_description():
     hold_object = LaunchConfiguration("hold_object")
     filter_held_object = LaunchConfiguration("filter_held_object")
     held_filter_mode = LaunchConfiguration("held_filter_mode")
+    payload = LaunchConfiguration("payload")
 
     # When robot_body_filter is on, scan comes from its output; otherwise the
     # sim's internal self-filtered cloud.
@@ -63,6 +70,11 @@ def generate_launch_description():
                                           "size-invariant, region-grow from the hand, default) | "
                                           "carry_volume (fixed hand region) | online (voxel "
                                           "estimate, needs motion) | shape (known primitive)"),
+        DeclareLaunchArgument("payload", default_value="box",
+                              description="Which payload SHAPE the robot carries (for testing the "
+                                          "prior-free filter against varied objects): "
+                                          "box | sphere | cylinder | pole | board | lshape "
+                                          "(or 'scene' to keep the geom in the scene XML)"),
 
         Node(
             package="robot_state_publisher",
@@ -82,6 +94,7 @@ def generate_launch_description():
                 "hold_object": hold_object,
                 "filter_held_object": filter_held_object,
                 "held_filter_mode": held_filter_mode,
+                "held_object_preset": payload,
             }],
         ),
 

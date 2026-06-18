@@ -26,6 +26,7 @@ setup(
         "console_scripts": [
             "g1_sim_node = g1_mujoco_sim.g1_sim_node:main",
             "self_filter_viz_node = g1_mujoco_sim.self_filter_viz_node:main",
+            "held_filter_metrics_node = g1_mujoco_sim.held_filter_metrics_node:main",
         ],
     },
 )
