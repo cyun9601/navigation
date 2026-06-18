@@ -44,6 +44,7 @@ def generate_launch_description():
     filter_held_object = LaunchConfiguration("filter_held_object")
     held_filter_mode = LaunchConfiguration("held_filter_mode")
     payload = LaunchConfiguration("payload")
+    body_vibration = LaunchConfiguration("body_vibration")
 
     # When robot_body_filter is on, scan comes from its output; otherwise the
     # sim's internal self-filtered cloud.
@@ -75,6 +76,11 @@ def generate_launch_description():
                                           "prior-free filter against varied objects): "
                                           "box | sphere | cylinder | pole | board | lshape "
                                           "(or 'scene' to keep the geom in the scene XML)"),
+        DeclareLaunchArgument("body_vibration", default_value="true",
+                              description="Inject walking-induced sensor shake (bob/sway/surge + "
+                                          "roll/pitch + jitter) into the physical LiDAR/camera poses "
+                                          "while keeping /odom and TF smooth -- tests real-world "
+                                          "robustness to point-cloud/TF misregistration"),
 
         Node(
             package="robot_state_publisher",
@@ -95,6 +101,7 @@ def generate_launch_description():
                 "filter_held_object": filter_held_object,
                 "held_filter_mode": held_filter_mode,
                 "held_object_preset": payload,
+                "body_vibration": body_vibration,
             }],
         ),
 

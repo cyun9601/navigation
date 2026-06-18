@@ -58,11 +58,22 @@ def quat_pitch(pitch):
     return np.array([math.cos(pitch / 2.0), 0.0, math.sin(pitch / 2.0), 0.0])
 
 
+def quat_roll(roll):
+    return np.array([math.cos(roll / 2.0), math.sin(roll / 2.0), 0.0, 0.0])
+
+
 def mat2quat(R):
     """3x3 rotation matrix -> quaternion (w, x, y, z)."""
     q = np.empty(4)
     mujoco.mju_mat2Quat(q, R.reshape(-1))
     return q
+
+
+def quat2mat(q):
+    """quaternion (w, x, y, z) -> 3x3 rotation matrix."""
+    R = np.empty(9)
+    mujoco.mju_quat2Mat(R, np.asarray(q, dtype=float))
+    return R.reshape(3, 3)
 
 
 # ----------------------------- the node ------------------------------------
@@ -113,6 +124,36 @@ class G1SimNode(Node):
         self.declare_parameter("camera_stride", 2)           # pixel decimation
         self.declare_parameter("show_camera_window", True)   # pop up the RGB view
         self.declare_parameter("camera_window_scale", 2.0)   # upscale the preview
+
+        # body vibration (walking-induced sensor shake).
+        # A real walking humanoid does NOT hold its torso perfectly level: it bobs
+        # up/down, sways side-to-side, surges fore/aft and rocks in roll/pitch at
+        # the gait cadence, plus high-frequency mounting jitter. We inject this into
+        # the PHYSICAL sensor poses only (the LiDAR raycast origin, mounted on
+        # torso_link via FK, and the camera render pose), while /odom and the
+        # published TF stay on the smooth planar pose -- exactly the real situation
+        # where the body shakes but the state estimator reports a clean base_link.
+        # The nav stack therefore sees clouds that DON'T register perfectly to the
+        # TF it trusts (point smearing, costmap "breathing", localization jitter) --
+        # the failure mode that decides real-world viability. Amplitude scales with
+        # commanded speed (gated to ~0 when standing) and ramps in/out smoothly.
+        self.declare_parameter("body_vibration", True)        # enable the shake
+        self.declare_parameter("vib_stride_freq", 0.9)        # gait cadence [strides/s] (~1.8 steps/s)
+        self.declare_parameter("vib_ref_speed", 0.5)          # speed [m/s] at which amplitudes are nominal
+        self.declare_parameter("vib_max_scale", 1.5)          # cap on the speed-amplitude factor
+        self.declare_parameter("vib_turn_weight", 0.3)        # |wz| -> equivalent walking speed [m per rad/s]
+        self.declare_parameter("vib_ramp", 0.08)              # gait-intensity low-pass (per tick, 0..1)
+        # linear amplitudes (peak displacement at vib_ref_speed) [m]
+        self.declare_parameter("vib_bob", 0.015)              # vertical bob (2x stride freq)
+        self.declare_parameter("vib_sway", 0.012)             # lateral sway (1x stride freq)
+        self.declare_parameter("vib_surge", 0.008)            # fore/aft surge (2x stride freq)
+        # micro angular amplitudes (peak, at vib_ref_speed) [deg] -- dominate the
+        # apparent shake at range (1 deg ~ 17 cm of point error at 10 m)
+        self.declare_parameter("vib_roll", 1.2)               # roll rock (1x stride freq)
+        self.declare_parameter("vib_pitch", 1.0)              # pitch rock (2x stride freq)
+        # high-frequency random jitter (gaussian std, scaled by gait intensity)
+        self.declare_parameter("vib_noise_lin", 0.004)        # translational [m]
+        self.declare_parameter("vib_noise_ang", 0.3)          # angular [deg]
 
         # self filter (built-in, geometric body-model filter)
         # Realistic point-in-shape containment, modelled on robot_self_filter /
@@ -229,6 +270,25 @@ class G1SimNode(Node):
         self.show_camera_window = bool(p("show_camera_window").value)
         self.cam_window_scale = float(p("camera_window_scale").value)
 
+        # body vibration (walking-induced sensor shake)
+        self.vib_enable = bool(p("body_vibration").value)
+        self.vib_freq = float(p("vib_stride_freq").value)
+        self.vib_ref_speed = float(p("vib_ref_speed").value)
+        self.vib_max_scale = float(p("vib_max_scale").value)
+        self.vib_turn_w = float(p("vib_turn_weight").value)
+        self.vib_ramp = float(p("vib_ramp").value)
+        self.vib_bob = float(p("vib_bob").value)
+        self.vib_sway = float(p("vib_sway").value)
+        self.vib_surge = float(p("vib_surge").value)
+        self.vib_roll = math.radians(float(p("vib_roll").value))
+        self.vib_pitch = math.radians(float(p("vib_pitch").value))
+        self.vib_noise_lin = float(p("vib_noise_lin").value)
+        self.vib_noise_ang = math.radians(float(p("vib_noise_ang").value))
+        # fixed inter-axis phase offsets so the components don't peak together
+        self.vib_ph_bob = math.pi / 2.0
+        self.vib_ph_surge = 0.0
+        self.vib_ph_pitch = math.pi / 2.0
+
         self.publish_self_filtered = bool(p("publish_self_filtered").value)
         self.publish_truth = bool(p("publish_truth").value)
         self.self_margin = float(p("self_filter_margin").value)
@@ -288,6 +348,11 @@ class G1SimNode(Node):
         self.cmd = Twist()
         self.last_cmd_time = self.get_clock().now()
         self.lock = threading.Lock()
+
+        # body-vibration state: gait phase accumulator + low-passed intensity
+        # (0 while standing, so the initial pose below is the clean nominal one)
+        self.vib_phase = 0.0
+        self.vib_amp = 0.0
 
         # initialise pose
         self._apply_kinematics()
@@ -568,15 +633,77 @@ class G1SimNode(Node):
             self.last_cmd_time = self.get_clock().now()
 
     # --------------------------------------------------------------------- #
+    def _step_vibration(self, vx, vy, wz):
+        """Advance the gait phase and the speed-driven shake intensity.
+
+        Cadence is held ~constant; the amplitude scales with how fast the robot
+        is commanded to move (translation + turning-in-place), low-passed so the
+        shake ramps in/out smoothly instead of snapping when /cmd_vel jumps.
+        """
+        if not self.vib_enable:
+            return
+        self.vib_phase += 2.0 * math.pi * self.vib_freq * self.dt
+        if self.vib_phase > 2.0 * math.pi:
+            self.vib_phase -= 2.0 * math.pi
+        move = math.hypot(vx, vy) + self.vib_turn_w * abs(wz)
+        target = 0.0
+        if self.vib_ref_speed > 0.0:
+            target = min(move / self.vib_ref_speed, self.vib_max_scale)
+        self.vib_amp += (target - self.vib_amp) * self.vib_ramp
+
+    def _vibration_offsets(self):
+        """Body-frame shake at the current phase/intensity.
+
+        Returns (dx, dy, dz, droll, dpitch): fore/aft, lateral, vertical [m] and
+        roll/pitch [rad]. Lateral sway and roll oscillate once per stride; vertical
+        bob, fore/aft surge and pitch rock twice per stride (once per step). High-
+        frequency gaussian jitter is added on top. Everything scales with the gait
+        intensity, so a standing robot returns zeros (stable sensors).
+        """
+        g = self.vib_amp
+        if not self.vib_enable or g <= 1e-4:
+            return 0.0, 0.0, 0.0, 0.0, 0.0
+        p = self.vib_phase
+        dy = g * self.vib_sway * math.sin(p)
+        droll = g * self.vib_roll * math.sin(p)
+        dz = g * self.vib_bob * math.sin(2.0 * p + self.vib_ph_bob)
+        dx = g * self.vib_surge * math.sin(2.0 * p + self.vib_ph_surge)
+        dpitch = g * self.vib_pitch * math.sin(2.0 * p + self.vib_ph_pitch)
+        nl = g * self.vib_noise_lin
+        na = g * self.vib_noise_ang
+        if nl > 0.0:
+            dx += np.random.normal(0.0, nl)
+            dy += np.random.normal(0.0, nl)
+            dz += np.random.normal(0.0, nl)
+        if na > 0.0:
+            droll += np.random.normal(0.0, na)
+            dpitch += np.random.normal(0.0, na)
+        return dx, dy, dz, droll, dpitch
+
+    # --------------------------------------------------------------------- #
     def _apply_kinematics(self):
         """Write base pose + mocap sensor poses, then run forward kinematics."""
         d, m = self.data, self.model
+        # Walking-induced sensor shake: a small body-frame perturbation
+        # (bob/sway/surge + roll/pitch + jitter) added to the PHYSICAL pose that
+        # drives the sensors. /odom and TF (published from base_x/y/yaw) stay
+        # clean, so the clouds are realistically inconsistent with the TF. dx, dy
+        # are in the body frame; dz is vertical; droll/dpitch tilt the body.
+        dx, dy, dz, droll, dpitch = self._vibration_offsets()
+        c, s = math.cos(self.base_yaw), math.sin(self.base_yaw)
+        dxw = c * dx - s * dy                  # body-frame planar offset -> world
+        dyw = s * dx + c * dy
+        # body orientation = nominal yaw, then the gait roll/pitch rock. Reused for
+        # both the floating-base qpos (LiDAR, mounted via FK) and the camera.
+        qb = quat_mul(quat_yaw(self.base_yaw),
+                      quat_mul(quat_roll(droll), quat_pitch(dpitch)))
+        R_body = quat2mat(qb)
+
         # floating base qpos = [x, y, z, qw, qx, qy, qz]
         a = self.base_qadr
-        d.qpos[a + 0] = self.base_x
-        d.qpos[a + 1] = self.base_y
-        d.qpos[a + 2] = self.stand_h
-        qb = quat_yaw(self.base_yaw)
+        d.qpos[a + 0] = self.base_x + dxw
+        d.qpos[a + 1] = self.base_y + dyw
+        d.qpos[a + 2] = self.stand_h + dz
         d.qpos[a + 3:a + 7] = qb
         # standing pose for all actuated joints = 0 (natural G1 stance)
         # (qpos already 0-initialised; leave as is)
@@ -624,11 +751,11 @@ class G1SimNode(Node):
                         self._held_models["camera"]["obj_keys"].size:
                     self._held_reset()
 
-        # camera mount: base-relative, orientation = yaw then pitch-down about Y
-        c, s = math.cos(self.base_yaw), math.sin(self.base_yaw)
-        cx_ = self.base_x + c * self.camera_off[0] - s * self.camera_off[1]
-        cy_ = self.base_y + s * self.camera_off[0] + c * self.camera_off[1]
-        d.mocap_pos[self.camera_mocap] = [cx_, cy_, self.camera_off[2]]
+        # camera mount: base_link-relative, orientation = body frame then pitch-down
+        # about Y. Mounted on the SAME perturbed body pose as the LiDAR (base_link
+        # origin at world z=0, raised by the bob dz), so both sensors shake together.
+        body_origin = np.array([self.base_x + dxw, self.base_y + dyw, dz])
+        d.mocap_pos[self.camera_mocap] = body_origin + R_body @ self.camera_off
         d.mocap_quat[self.camera_mocap] = quat_mul(qb, quat_pitch(self.camera_pitch))
 
     # --------------------------------------------------------------------- #
@@ -651,6 +778,7 @@ class G1SimNode(Node):
         self.base_yaw = math.atan2(math.sin(self.base_yaw + wz * self.dt),
                                    math.cos(self.base_yaw + wz * self.dt))
 
+        self._step_vibration(vx, vy, wz)
         self._apply_kinematics()
 
         stamp = now.to_msg()
